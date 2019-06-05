@@ -196,6 +196,9 @@ struct Curl_sh_entry {
   unsigned int users; /* number of transfers using this */
   unsigned int readers; /* this many transfers want to read */
   unsigned int writers; /* this many transfers want to write */
+  unsigned int blocked:1; /* if TRUE, blocked from being removed */
+  unsigned int removed:1; /* if TRUE, this entry is "removed" but prevented
+                             from it by "blocked" being set! */
 };
 /* bits for 'action' having no bits means this socket is not expecting any
    action */
@@ -206,9 +209,14 @@ struct Curl_sh_entry {
 static struct Curl_sh_entry *sh_getentry(struct curl_hash *sh,
                                          curl_socket_t s)
 {
-  if(s != CURL_SOCKET_BAD)
+  if(s != CURL_SOCKET_BAD) {
     /* only look for proper sockets */
-    return Curl_hash_pick(sh, (char *)&s, sizeof(curl_socket_t));
+    struct Curl_sh_entry *entry =
+      Curl_hash_pick(sh, (char *)&s, sizeof(curl_socket_t));
+    if(entry && entry->removed)
+      return NULL;
+    return entry;
+  }
   return NULL;
 }
 
@@ -244,17 +252,24 @@ static struct Curl_sh_entry *sh_addentry(struct curl_hash *sh,
 static void sh_delentry(struct Curl_sh_entry *entry,
                         struct curl_hash *sh, curl_socket_t s)
 {
-  struct curl_llist *list = &entry->list;
-  struct curl_llist_element *e;
-  /* clear the list of transfers first */
-  for(e = list->head; e; e = list->head) {
-    struct Curl_easy *dta = e->ptr;
-    Curl_llist_remove(&entry->list, e, NULL);
-    dta->sh_entry = NULL;
+  if(entry->blocked) {
+    entry->removed = TRUE; /* pretend */
+    return;
   }
-  /* We remove the hash entry. This will end up in a call to
-     sh_freeentry(). */
-  Curl_hash_delete(sh, (char *)&s, sizeof(curl_socket_t));
+  else {
+    struct curl_llist *list = &entry->list;
+    struct curl_llist_element *e;
+    while(Curl_llist_count(list)) {
+      e = list->tail;
+      Curl_llist_remove(list, e, NULL);
+      free(e);
+    }
+    Curl_llist_destroy(&entry->list, NULL);
+
+    /* We remove the hash entry. This will end up in a call to
+       sh_freeentry(). */
+    Curl_hash_delete(sh, (char *)&s, sizeof(curl_socket_t));
+  }
 }
 
 /*
@@ -320,17 +335,6 @@ static CURLMcode multi_addmsg(struct Curl_multi *multi,
   return CURLM_OK;
 }
 
-/*
- * multi_freeamsg()
- *
- * Callback used by the llist system when a single list entry is destroyed.
- */
-static void multi_freeamsg(void *a, void *b)
-{
-  (void)a;
-  (void)b;
-}
-
 struct Curl_multi *Curl_multi_handle(int hashsize, /* socket hash */
                                      int chashsize) /* connection hash */
 {
@@ -350,8 +354,8 @@ struct Curl_multi *Curl_multi_handle(int hashsize, /* socket hash */
   if(Curl_conncache_init(&multi->conn_cache, chashsize))
     goto error;
 
-  Curl_llist_init(&multi->msglist, multi_freeamsg);
-  Curl_llist_init(&multi->pending, multi_freeamsg);
+  Curl_llist_init(&multi->msglist, NULL);
+  Curl_llist_init(&multi->pending, NULL);
 
   /* -1 means it not set by user, use the default value */
   multi->maxconnects = -1;
@@ -789,11 +793,6 @@ bool Curl_multiplex_wanted(const struct Curl_multi *multi)
 static void detach_connnection(struct Curl_easy *data)
 {
   struct connectdata *conn = data->conn;
-  if(data->sh_entry) {
-    /* still listed as a user of a socket hash entry, remove it */
-    Curl_llist_remove(&data->sh_entry->list, &data->sh_queue, NULL);
-    data->sh_entry = NULL;
-  }
   if(conn)
     Curl_llist_remove(&conn->easyq, &data->conn_queue, NULL);
   data->conn = NULL;
@@ -1266,6 +1265,9 @@ static CURLMcode multi_runsingle(struct Curl_multi *multi,
     bool stream_error = FALSE;
     rc = CURLM_OK;
 
+    DEBUGASSERT((data->mstate <= CURLM_STATE_CONNECT) ||
+                (data->mstate >= CURLM_STATE_DONE) ||
+                data->conn);
     if(!data->conn &&
        data->mstate > CURLM_STATE_CONNECT &&
        data->mstate < CURLM_STATE_DONE) {
@@ -2281,6 +2283,11 @@ static CURLMcode singlesocket(struct Curl_multi *multi,
     }
     else if(!sincebefore) {
       /* a new user */
+      struct curl_llist_element *storage =
+        malloc(sizeof(struct curl_llist_element));
+      if(!storage)
+        return CURLE_OUT_OF_MEMORY;
+
       entry->users++;
       if(action & CURL_POLL_IN)
         entry->readers++;
@@ -2289,8 +2296,7 @@ static CURLMcode singlesocket(struct Curl_multi *multi,
 
       /* add 'data' to the list of handles using this socket! */
       Curl_llist_insert_next(&entry->list, entry->list.tail,
-                             data, &data->sh_queue);
-      data->sh_entry = entry;
+                             data, storage);
     }
 
     comboaction = (entry->writers? CURL_POLL_OUT : 0) |
@@ -2351,6 +2357,19 @@ static CURLMcode singlesocket(struct Curl_multi *multi,
                            multi->socket_userp,
                            entry->socketp);
         sh_delentry(entry, &multi->sockhash, s);
+      }
+      else {
+        /* still users, but remove this handle as a user of this socket */
+        struct curl_llist *list = &entry->list;
+        struct curl_llist_element *e;
+        /* The socket can be shared by many transfers, iterate. */
+        for(e = list->head; e; e = e->next) {
+          struct Curl_easy *dta = (struct Curl_easy *)e->ptr;
+          if(data == dta) {
+            Curl_llist_remove(list, e, NULL);
+            break;
+          }
+        }
       }
     }
   } /* for loop over numsocks */
@@ -2500,6 +2519,9 @@ static CURLMcode multi_socket(struct Curl_multi *multi,
       struct curl_llist_element *enext;
       SIGPIPE_VARIABLE(pipe_st);
 
+      /* block this sockhash entry from being removed in a sub function called
+         from here */
+      entry->blocked = TRUE;
       /* the socket can be shared by many transfers, iterate */
       for(e = list->head; e; e = enext) {
         data = (struct Curl_easy *)e->ptr;
@@ -2530,6 +2552,10 @@ static CURLMcode multi_socket(struct Curl_multi *multi,
           if(result)
             return result;
         }
+      }
+      if(entry->removed) {
+        entry->blocked = FALSE; /* unblock */
+        sh_delentry(entry, &multi->sockhash, s); /* delete for real */
       }
 
       /* Now we fall-through and do the timer-based stuff, since we don't want

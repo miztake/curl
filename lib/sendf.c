@@ -237,7 +237,9 @@ void Curl_infof(struct Curl_easy *data, const char *fmt, ...)
     size_t len;
     char print_buffer[2048 + 1];
     va_start(ap, fmt);
-    len = mvsnprintf(print_buffer, sizeof(print_buffer), fmt, ap);
+    len = msnprintf(print_buffer, sizeof(print_buffer), "[%p] ", data);
+    len += mvsnprintf(&print_buffer[len], sizeof(print_buffer) - len,
+                      fmt, ap);
     /*
      * Indicate truncation of the input by replacing the last 3 characters
      * with "...", and transfer the newline over in case the format had one.
